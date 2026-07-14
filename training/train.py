@@ -94,14 +94,15 @@ if args.hours:
 print("Loading dataset...")
 
 
+DATASET_DIR = "/kaggle/input/datasets/ducky69/dataset-rust"
+
 train_dataset = TokenDataset(
-    "datasets/train.bin",
+    f"{DATASET_DIR}/train.bin",
     context_length
 )
 
-
 val_dataset = TokenDataset(
-    "datasets/validation.bin",
+    f"{DATASET_DIR}/validation.bin",
     context_length
 )
 
