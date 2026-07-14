@@ -46,7 +46,7 @@ args = parser.parse_args()
 
 device = "cuda"
 
-batch_size = 5
+batch_size = 8
 
 gradient_accumulation_steps = 2
 
