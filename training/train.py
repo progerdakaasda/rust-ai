@@ -2,6 +2,7 @@ import os
 import time
 import signal
 import argparse
+import shutil
 from contextlib import nullcontext
 
 import numpy as np
