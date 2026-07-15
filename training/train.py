@@ -22,21 +22,23 @@ from training.scheduler import cosine_scheduler
 
 class TokenDataset(Dataset):
 
-    def __init__(self, filename, context_length):
+    def __init__(self, filename, context_length, max_samples=500_000):
         self.data = np.memmap(
             filename,
             dtype=np.uint16,
             mode="r"
         )
         self.context_length = context_length
-        self.length = len(self.data) - context_length - 1
+        self.true_length = len(self.data) - context_length - 1
+        # Cap to avoid DistributedSampler allocating billions of indices in RAM
+        self.length = min(self.true_length, max_samples)
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        # Ignore sequential index, sample randomly
-        idx = random.randint(0, self.length - 1)
+        # Always sample randomly from the FULL file regardless of idx
+        idx = random.randint(0, self.true_length - 1)
 
         x = torch.from_numpy(
             self.data[idx : idx + self.context_length].astype(np.int64)
@@ -192,8 +194,21 @@ def main():
         print(f"Train file:      {train_path}", flush=True)
         print(f"Validation file: {val_path}",  flush=True)
 
-    train_dataset = TokenDataset(train_path, context_length)
-    val_dataset   = TokenDataset(val_path,   context_length)
+    train_dataset = TokenDataset(
+        train_path,
+        context_length,
+        max_samples=500_000,
+    )
+
+    val_dataset = TokenDataset(
+        val_path,
+        context_length,
+        max_samples=50_000,
+    )
+
+    if is_main_process:
+        print(f"Train samples:      {len(train_dataset):,}", flush=True)
+        print(f"Validation samples: {len(val_dataset):,}", flush=True)
 
     if ddp:
         train_sampler = DistributedSampler(
@@ -242,6 +257,9 @@ def main():
     )
 
     train_iter = iter(train_loader)
+
+    if is_main_process:
+        print("Dataset ready!", flush=True)
 
     # ==========================
     # Model -- built directly on the target GPU
