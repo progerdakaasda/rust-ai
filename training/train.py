@@ -102,6 +102,42 @@ def main():
     args = parser.parse_args()
 
     # ==========================
+    # Distributed setup
+    # ==========================
+    # Detect if we were launched with torchrun / torch.distributed.launch
+    ddp = "LOCAL_RANK" in os.environ
+
+    if ddp:
+        local_rank  = int(os.environ["LOCAL_RANK"])
+        world_size  = int(os.environ.get("WORLD_SIZE", 1))
+    else:
+        local_rank  = 0
+        world_size  = 1
+
+    # Every process must have a GPU when doing DDP
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "No CUDA devices found. This script requires at least one GPU."
+        )
+
+    # Assign one GPU per process
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    if ddp:
+        dist.init_process_group(backend="nccl")
+
+    is_main_process = (local_rank == 0)
+
+    if is_main_process:
+        print(f"Using device: {device}", flush=True)
+        print(f"CUDA device name: {torch.cuda.get_device_name(local_rank)}", flush=True)
+        if ddp:
+            print(f"Distributed training with {world_size} GPUs", flush=True)
+        else:
+            print("Single-GPU training", flush=True)
+
+    # ==========================
     # Performance settings
     # ==========================
     torch.set_num_threads(args.workers)
@@ -114,45 +150,20 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     # ==========================
-    # Distributed setup
-    # ==========================
-    ddp = "LOCAL_RANK" in os.environ and torch.cuda.is_available()
-
-    if ddp:
-        dist.init_process_group(backend="nccl")
-
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = dist.get_world_size()
-
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        local_rank = 0
-        world_size = 1
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    is_main_process = (local_rank == 0)
-
-    if is_main_process:
-        print(f"Using device: {device}", flush=True)
-        if ddp:
-            print(f"Distributed training with {world_size} GPUs", flush=True)
-
-    # ==========================
     # Settings
     # ==========================
-    batch_size = 8
+    batch_size                 = 8
     gradient_accumulation_steps = 2
-    context_length = 1024
-    max_steps = 200_000
+    context_length             = 1024
+    max_steps                  = 200_000
 
-    learning_rate = 3e-4
-    min_learning_rate = 3e-5
-    warmup_steps = 2000
-    weight_decay = 0.1
+    learning_rate              = 3e-4
+    min_learning_rate          = 3e-5
+    warmup_steps               = 2000
+    weight_decay               = 0.1
 
-    validation_interval = 500
-    checkpoint_interval = 500
+    validation_interval        = 500
+    checkpoint_interval        = 500
 
     # ==========================
     # Timer
@@ -169,21 +180,28 @@ def main():
     # ==========================
     # Paths
     # ==========================
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    if is_main_process:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    if ddp:
+        dist.barrier()  # All ranks wait until the directory exists
 
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest.pt")
-    best_checkpoint = os.path.join(args.checkpoint_dir, "best.pt")
+    best_checkpoint   = os.path.join(args.checkpoint_dir, "best.pt")
 
     input_latest = os.path.join(args.dataset_dir, "checkpoints", "latest.pt")
-    input_best = os.path.join(args.dataset_dir, "checkpoints", "best.pt")
+    input_best   = os.path.join(args.dataset_dir, "checkpoints", "best.pt")
 
-    # Bootstrap checkpoint from Kaggle input if needed
-    if args.resume:
+    # Bootstrap checkpoint from Kaggle input if needed (main process only)
+    if args.resume and is_main_process:
         if (not os.path.exists(latest_checkpoint)) and os.path.exists(input_latest):
             shutil.copy2(input_latest, latest_checkpoint)
 
         if (not os.path.exists(best_checkpoint)) and os.path.exists(input_best):
             shutil.copy2(input_best, best_checkpoint)
+
+    if ddp:
+        dist.barrier()  # Wait for copies to finish before any rank loads
 
     # ==========================
     # Dataset
@@ -194,65 +212,66 @@ def main():
     dtype = np.uint16 if args.dtype == "uint16" else np.uint32
 
     train_path = os.path.join(args.dataset_dir, "train.bin")
-    val_path = os.path.join(args.dataset_dir, "validation.bin")
+    val_path   = os.path.join(args.dataset_dir, "validation.bin")
 
     if is_main_process:
-        print(f"Train file: {train_path}", flush=True)
-        print(f"Validation file: {val_path}", flush=True)
+        print(f"Train file:      {train_path}", flush=True)
+        print(f"Validation file: {val_path}",  flush=True)
 
-    train_dataset = BinTokenDataset(
-        train_path,
-        context_length,
-        dtype=dtype
-    )
-
-    val_dataset = BinTokenDataset(
-        val_path,
-        context_length,
-        dtype=dtype
-    )
+    train_dataset = BinTokenDataset(train_path, context_length, dtype=dtype)
+    val_dataset   = BinTokenDataset(val_path,   context_length, dtype=dtype)
 
     if ddp:
         train_sampler = DistributedSampler(
             train_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
             shuffle=True,
-            drop_last=False
+            drop_last=True,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            shuffle=False,
+            drop_last=False,
         )
     else:
         train_sampler = None
+        val_sampler   = None
 
     loader_kwargs = dict(
         batch_size=batch_size,
         num_workers=args.workers,
         pin_memory=True,
         persistent_workers=(args.workers > 0),
-        drop_last=True
+        drop_last=True,
+        prefetch_factor=(2 if args.workers > 0 else None),
     )
-
-    if args.workers > 0:
-        loader_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_dataset,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        **loader_kwargs
+        **loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_dataset,
         shuffle=False,
-        **{**loader_kwargs, "drop_last": False}
+        sampler=val_sampler,
+        **{**loader_kwargs, "drop_last": False},
     )
 
     train_iter = iter(train_loader)
 
     # ==========================
-    # Model
+    # Model  –– built directly on the target GPU
     # ==========================
     if is_main_process:
         print("Creating model...", flush=True)
 
+    # Build on the correct device immediately so weights never touch CPU RAM
     base_model = GPT(GPTConfig()).to(device)
 
     if ddp:
@@ -260,7 +279,7 @@ def main():
             base_model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False
+            find_unused_parameters=False,
         )
     else:
         model = base_model
@@ -275,7 +294,8 @@ def main():
     optimizer = torch.optim.AdamW(
         base_model.parameters(),
         lr=learning_rate,
-        weight_decay=weight_decay
+        weight_decay=weight_decay,
+        fused=True,   # Faster fused CUDA kernel for AdamW
     )
 
     scheduler = cosine_scheduler(
@@ -283,39 +303,47 @@ def main():
         warmup_steps,
         max_steps,
         min_learning_rate,
-        learning_rate
+        learning_rate,
     )
 
-    scaler = torch.amp.GradScaler("cuda")
+    # GradScaler is per-process and lives on the same GPU
+    scaler  = torch.amp.GradScaler("cuda")
     loss_fn = nn.CrossEntropyLoss()
 
     # ==========================
     # Resume
     # ==========================
-    step = 0
-    best_loss = float("inf")
+    step        = 0
+    best_loss   = float("inf")
     tokens_seen = 0
 
-    if args.resume:
+    if args.resume and os.path.exists(latest_checkpoint):
         if is_main_process:
             print("Loading checkpoint...", flush=True)
 
-        if os.path.exists(latest_checkpoint):
-            step, best_loss, tokens_seen = load_checkpoint(
-                latest_checkpoint,
-                base_model,
-                optimizer,
-                scheduler,
-                scaler
-            )
+        # Load on the correct GPU directly
+        step, best_loss, tokens_seen = load_checkpoint(
+            latest_checkpoint,
+            base_model,
+            optimizer,
+            scheduler,
+            scaler,
+            map_location=device,
+        )
 
-            if is_main_process:
-                print(f"Resumed from step {step}", flush=True)
-        elif is_main_process:
-            print("No latest.pt found, starting from scratch.", flush=True)
+        if is_main_process:
+            print(f"Resumed from step {step}", flush=True)
+
+        # Make sure all ranks start with the same weights
+        if ddp:
+            for param in base_model.parameters():
+                dist.broadcast(param.data, src=0)
+
+    elif args.resume and is_main_process:
+        print("No latest.pt found, starting from scratch.", flush=True)
 
     # ==========================
-    # Shutdown
+    # Shutdown signal handler
     # ==========================
     running = True
 
@@ -325,44 +353,46 @@ def main():
             print("\nStopping safely...", flush=True)
         running = False
 
-    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
     # ==========================
-    # Validation
+    # Validation helper
     # ==========================
     @torch.no_grad()
     def validate():
         model.eval()
 
-        total_loss = 0.0
-        count = 0
+        total_loss = torch.zeros(1, device=device)
+        count      = torch.zeros(1, device=device)
 
-        for x, y in val_loader:
+        for batch_idx, (x, y) in enumerate(val_loader):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.float16
-            ):
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(x)
-                loss = loss_fn(
+                loss   = loss_fn(
                     logits.view(-1, logits.size(-1)),
-                    y.view(-1)
+                    y.view(-1),
                 )
 
-            total_loss += loss.item()
-            count += 1
+            total_loss += loss
+            count      += 1
 
-            if count >= 100:
+            if count.item() >= 100:
                 break
 
+        # Aggregate across all GPUs so every rank sees the same number
+        if ddp:
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count,      op=dist.ReduceOp.SUM)
+
         model.train()
-        return total_loss / max(count, 1)
+        return (total_loss / count.clamp(min=1)).item()
 
     # ==========================
-    # Training
+    # Training loop
     # ==========================
     model.train()
     epoch = 0
@@ -371,6 +401,7 @@ def main():
         print("Starting training...", flush=True)
 
     while step < max_steps and running:
+        # ---- time-limit check ----
         if time_limit and (time.time() - start_time > time_limit):
             if is_main_process:
                 print("Time limit reached", flush=True)
@@ -395,6 +426,7 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
+            # Only sync gradients on the last micro-step
             sync_context = (
                 model.no_sync()
                 if ddp and micro_step < gradient_accumulation_steps - 1
@@ -402,14 +434,11 @@ def main():
             )
 
             with sync_context:
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.float16
-                ):
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
                     logits = model(x)
-                    loss = loss_fn(
+                    loss   = loss_fn(
                         logits.view(-1, logits.size(-1)),
-                        y.view(-1)
+                        y.view(-1),
                     )
                     loss = loss / gradient_accumulation_steps
 
@@ -424,18 +453,19 @@ def main():
         scheduler.step()
 
         tokens_seen += (
-            batch_size *
-            context_length *
-            gradient_accumulation_steps *
-            world_size
+            batch_size
+            * context_length
+            * gradient_accumulation_steps
+            * world_size
         )
 
         step += 1
 
         if is_main_process and step % 10 == 0:
+            lr_now = scheduler.get_last_lr()[0]
             print(
-                f"step {step}/{max_steps} | loss {total_loss:.4f}",
-                flush=True
+                f"step {step}/{max_steps} | loss {total_loss:.4f} | lr {lr_now:.2e}",
+                flush=True,
             )
 
         # ======================
@@ -445,8 +475,9 @@ def main():
             if ddp:
                 dist.barrier()
 
+            val_loss = validate()   # All ranks participate now
+
             if is_main_process:
-                val_loss = validate()
                 print(f"Validation loss: {val_loss:.4f}", flush=True)
 
                 if val_loss < best_loss:
@@ -461,7 +492,7 @@ def main():
                         scaler,
                         step,
                         best_loss,
-                        tokens_seen
+                        tokens_seen,
                     )
 
             if ddp:
@@ -483,9 +514,9 @@ def main():
                     scaler,
                     step,
                     best_loss,
-                    tokens_seen
+                    tokens_seen,
                 )
-                print("Saved latest.pt", flush=True)
+                print(f"Saved latest.pt (step {step})", flush=True)
 
             if ddp:
                 dist.barrier()
@@ -497,7 +528,7 @@ def main():
         dist.barrier()
 
     if is_main_process:
-        print("Saving latest checkpoint...", flush=True)
+        print("Saving final checkpoint...", flush=True)
 
         save_checkpoint(
             latest_checkpoint,
@@ -507,7 +538,7 @@ def main():
             scaler,
             step,
             best_loss,
-            tokens_seen
+            tokens_seen,
         )
 
         print("Finished!", flush=True)
