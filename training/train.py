@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.multiprocessing as torch_mp
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -17,6 +18,29 @@ from model.gpt import GPT
 from model.config import GPTConfig
 from training.checkpoint import save_checkpoint, load_checkpoint
 from training.scheduler import cosine_scheduler
+
+
+# ==========================
+# Kaggle-specific fixes
+# ==========================
+# 1) Kaggle's dual-T4 instances don't support NCCL P2P/InfiniBand properly
+#    inside their container. Without disabling these, dist.init_process_group
+#    (and later all_reduce/broadcast calls) will hang forever with no error.
+#    Set these BEFORE any torch.distributed call. Only set them if the user
+#    hasn't already overridden them.
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+# Helps surface a real error instead of a silent hang if something is still wrong.
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+
+# 2) Kaggle containers ship with a very small /dev/shm (often 64MB). The default
+#    DataLoader sharing strategy ("file_descriptor"/shared memory) needs much
+#    more than that once you have multiple workers + pin_memory queuing batches,
+#    and it hangs (not crashes) when it runs out, which looks exactly like
+#    "stuck, RAM climbing, GPU idle". Switching to "file_system" avoids /dev/shm
+#    entirely.
+torch_mp.set_sharing_strategy("file_system")
 
 
 class TokenDataset(Dataset):
@@ -61,7 +85,16 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=4
+        default=2,
+        help="Number of DataLoader worker processes PER GPU. Use 0 to disable "
+             "multiprocessing entirely (safest fallback if you still see hangs)."
+    )
+
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=4,
+        help="torch intra-op thread count (was previously conflated with DataLoader workers)."
     )
 
     parser.add_argument(
@@ -101,7 +134,13 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     if ddp:
-        dist.init_process_group(backend="nccl")
+        # timeout guards against another silent hang: if init still can't
+        # complete (e.g. NCCL truly broken), fail loudly after 2 minutes
+        # instead of hanging for the rest of the session.
+        dist.init_process_group(
+            backend="nccl",
+            timeout=torch.distributed.default_pg_timeout if hasattr(torch.distributed, "default_pg_timeout") else None,
+        )
 
     is_main_process = (local_rank == 0)
 
@@ -111,12 +150,12 @@ def main():
         if ddp:
             print(f"Distributed training with {world_size} GPUs", flush=True)
         else:
-            print("Single-GPU training", flush=True)
+            print("Single-GPU training (LOCAL_RANK not set — did you launch with torchrun?)", flush=True)
 
     # ==========================
     # Performance settings
     # ==========================
-    torch.set_num_threads(args.workers)
+    torch.set_num_threads(args.cpu_threads)
     torch.set_num_interop_threads(1)
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -190,6 +229,15 @@ def main():
     if is_main_process:
         print(f"Train file:      {train_path}", flush=True)
         print(f"Validation file: {val_path}",  flush=True)
+        # Sanity-check the files actually exist and report their size, since a
+        # bad --dataset-dir path silently produces a 0-length memmap that will
+        # also look like "stuck at startup".
+        for p in (train_path, val_path):
+            if os.path.exists(p):
+                size_gb = os.path.getsize(p) / 1024**3
+                print(f"  {p}: {size_gb:.2f} GB", flush=True)
+            else:
+                print(f"  WARNING: {p} does not exist!", flush=True)
 
     train_dataset = TokenDataset(train_path, context_length)
     val_dataset   = TokenDataset(val_path,   context_length)
@@ -203,22 +251,22 @@ def main():
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=args.workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=(args.workers > 0),
         drop_last=True,
-        prefetch_factor=2,
+        prefetch_factor=(2 if args.workers > 0 else None),
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=args.workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=(args.workers > 0),
         drop_last=False,
-        prefetch_factor=2,
+        prefetch_factor=(2 if args.workers > 0 else None),
     )
 
     train_iter = iter(train_loader)
