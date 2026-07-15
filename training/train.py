@@ -12,7 +12,6 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 from model.gpt import GPT
 from model.config import GPTConfig
@@ -22,7 +21,7 @@ from training.scheduler import cosine_scheduler
 
 class TokenDataset(Dataset):
 
-    def __init__(self, filename, context_length, max_samples=500_000):
+    def __init__(self, filename, context_length):
         self.data = np.memmap(
             filename,
             dtype=np.uint16,
@@ -30,14 +29,13 @@ class TokenDataset(Dataset):
         )
         self.context_length = context_length
         self.true_length = len(self.data) - context_length - 1
-        # Cap to avoid DistributedSampler allocating billions of indices in RAM
-        self.length = min(self.true_length, max_samples)
 
     def __len__(self):
-        return self.length
+        # Return small fixed number so no sampler ever builds a huge index
+        return 10_000
 
     def __getitem__(self, idx):
-        # Always sample randomly from the FULL file regardless of idx
+        # Always sample randomly from the FULL file
         idx = random.randint(0, self.true_length - 1)
 
         x = torch.from_numpy(
@@ -162,7 +160,7 @@ def main():
         os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     if ddp:
-        dist.barrier()  # All ranks wait until directory exists
+        dist.barrier()
 
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest.pt")
     best_checkpoint   = os.path.join(args.checkpoint_dir, "best.pt")
@@ -170,7 +168,6 @@ def main():
     input_latest = os.path.join(args.dataset_dir, "checkpoints", "latest.pt")
     input_best   = os.path.join(args.dataset_dir, "checkpoints", "best.pt")
 
-    # Bootstrap checkpoint from Kaggle input if needed (main process only)
     if args.resume and is_main_process:
         if (not os.path.exists(latest_checkpoint)) and os.path.exists(input_latest):
             shutil.copy2(input_latest, latest_checkpoint)
@@ -179,7 +176,7 @@ def main():
             shutil.copy2(input_best, best_checkpoint)
 
     if ddp:
-        dist.barrier()  # Wait for copies to finish before any rank loads
+        dist.barrier()
 
     # ==========================
     # Dataset
@@ -194,50 +191,19 @@ def main():
         print(f"Train file:      {train_path}", flush=True)
         print(f"Validation file: {val_path}",  flush=True)
 
-    train_dataset = TokenDataset(
-        train_path,
-        context_length,
-        max_samples=500_000,
-    )
-
-    val_dataset = TokenDataset(
-        val_path,
-        context_length,
-        max_samples=50_000,
-    )
+    train_dataset = TokenDataset(train_path, context_length)
+    val_dataset   = TokenDataset(val_path,   context_length)
 
     if is_main_process:
-        print(f"Train samples:      {len(train_dataset):,}", flush=True)
-        print(f"Validation samples: {len(val_dataset):,}", flush=True)
+        print(f"Dataset ready! Tokens in train: {train_dataset.true_length:,}", flush=True)
 
-    if ddp:
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=local_rank,
-            shuffle=True,
-            drop_last=True,
-        )
-        val_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=local_rank,
-            shuffle=False,
-            drop_last=False,
-        )
-    else:
-        train_sampler = None
-        val_sampler   = None
-
-    # 2 workers per GPU is enough for memory-mapped files
-    num_workers = 2
-
+    # No DistributedSampler - random sampling handles distribution naturally
+    # Each GPU gets different random samples automatically
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=num_workers,
+        shuffle=True,
+        num_workers=2,
         pin_memory=True,
         persistent_workers=False,
         drop_last=True,
@@ -248,8 +214,7 @@ def main():
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        sampler=val_sampler,
-        num_workers=num_workers,
+        num_workers=2,
         pin_memory=True,
         persistent_workers=False,
         drop_last=False,
@@ -259,7 +224,7 @@ def main():
     train_iter = iter(train_loader)
 
     if is_main_process:
-        print("Dataset ready!", flush=True)
+        print("Dataloader ready!", flush=True)
 
     # ==========================
     # Model -- built directly on the target GPU
@@ -267,10 +232,8 @@ def main():
     if is_main_process:
         print("Creating model...", flush=True)
 
-    # Build directly on GPU - never touches CPU RAM
     base_model = GPT(GPTConfig()).to(device)
 
-    # Verify model is on GPU
     if is_main_process:
         for i in range(torch.cuda.device_count()):
             mem = torch.cuda.memory_allocated(i) / 1024**2
@@ -297,7 +260,7 @@ def main():
         base_model.parameters(),
         lr=learning_rate,
         weight_decay=weight_decay,
-        fused=True,  # Faster fused CUDA kernel for AdamW
+        fused=True,
     )
 
     scheduler = cosine_scheduler(
@@ -308,7 +271,6 @@ def main():
         learning_rate,
     )
 
-    # GradScaler is per-process and lives on the same GPU
     scaler  = torch.amp.GradScaler("cuda")
     loss_fn = nn.CrossEntropyLoss()
 
@@ -323,20 +285,17 @@ def main():
         if is_main_process:
             print("Loading checkpoint...", flush=True)
 
-        # Load on the correct GPU directly
         step, best_loss, tokens_seen = load_checkpoint(
             latest_checkpoint,
             base_model,
             optimizer,
             scheduler,
             scaler,
-            map_location=device,
         )
 
         if is_main_process:
             print(f"Resumed from step {step}", flush=True)
 
-        # Make sure all ranks start with identical weights
         if ddp:
             for param in base_model.parameters():
                 dist.broadcast(param.data, src=0)
@@ -385,7 +344,6 @@ def main():
             if count.item() >= 100:
                 break
 
-        # Aggregate across all GPUs so every rank sees the same number
         if ddp:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(count,      op=dist.ReduceOp.SUM)
@@ -403,14 +361,10 @@ def main():
         print("Starting training...", flush=True)
 
     while step < max_steps and running:
-        # ---- time-limit check ----
         if time_limit and (time.time() - start_time > time_limit):
             if is_main_process:
                 print("Time limit reached", flush=True)
             break
-
-        if ddp and train_sampler is not None:
-            train_sampler.set_epoch(epoch)
 
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
@@ -420,15 +374,12 @@ def main():
                 x, y = next(train_iter)
             except StopIteration:
                 epoch += 1
-                if ddp and train_sampler is not None:
-                    train_sampler.set_epoch(epoch)
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
 
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # Only sync gradients on the last micro-step
             sync_context = (
                 model.no_sync()
                 if ddp and micro_step < gradient_accumulation_steps - 1
@@ -477,7 +428,7 @@ def main():
             if ddp:
                 dist.barrier()
 
-            val_loss = validate()  # All ranks participate now
+            val_loss = validate()
 
             if is_main_process:
                 print(f"Validation loss: {val_loss:.4f}", flush=True)
