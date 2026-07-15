@@ -3,6 +3,7 @@ import time
 import signal
 import argparse
 import shutil
+import random
 from contextlib import nullcontext
 
 import numpy as np
@@ -19,49 +20,32 @@ from training.checkpoint import save_checkpoint, load_checkpoint
 from training.scheduler import cosine_scheduler
 
 
-class BinTokenDataset(Dataset):
-    """
-    Memory-mapped token dataset for flat binary token files.
+class TokenDataset(Dataset):
 
-    Expects:
-      - train.bin
-      - validation.bin
-
-    where each file is a flat array of token IDs stored as uint16 or uint32.
-    """
-    def __init__(self, path: str, context_length: int, dtype: np.dtype):
-        self.path = path
+    def __init__(self, filename, context_length):
+        self.data = np.memmap(
+            filename,
+            dtype=np.uint16,
+            mode="r"
+        )
         self.context_length = context_length
-        self.dtype = np.dtype(dtype)
-        self._data = None
-        self._n_tokens = os.path.getsize(path) // self.dtype.itemsize
-
-        if self._n_tokens <= context_length + 1:
-            raise ValueError(
-                f"File {path} is too small for context_length={context_length}"
-            )
-
-    def _open(self):
-        if self._data is None:
-            self._data = np.memmap(self.path, dtype=self.dtype, mode="r")
-        return self._data
+        self.length = len(self.data) - context_length - 1
 
     def __len__(self):
-        return self._n_tokens - self.context_length - 1
+        return self.length
 
     def __getitem__(self, idx):
-        data = self._open()
+        # Ignore sequential index, sample randomly
+        idx = random.randint(0, self.length - 1)
 
-        x = np.asarray(
-            data[idx : idx + self.context_length],
-            dtype=np.int64
+        x = torch.from_numpy(
+            self.data[idx : idx + self.context_length].astype(np.int64)
         )
-        y = np.asarray(
-            data[idx + 1 : idx + 1 + self.context_length],
-            dtype=np.int64
+        y = torch.from_numpy(
+            self.data[idx + 1 : idx + self.context_length + 1].astype(np.int64)
         )
 
-        return torch.from_numpy(x), torch.from_numpy(y)
+        return x, y
 
 
 def main():
@@ -78,13 +62,6 @@ def main():
         "--workers",
         type=int,
         default=4
-    )
-
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="uint16",
-        choices=["uint16", "uint32"]
     )
 
     parser.add_argument(
@@ -208,8 +185,6 @@ def main():
     if is_main_process:
         print("Loading dataset...", flush=True)
 
-    dtype = np.uint16 if args.dtype == "uint16" else np.uint32
-
     train_path = os.path.join(args.dataset_dir, "train.bin")
     val_path   = os.path.join(args.dataset_dir, "validation.bin")
 
@@ -217,8 +192,8 @@ def main():
         print(f"Train file:      {train_path}", flush=True)
         print(f"Validation file: {val_path}",  flush=True)
 
-    train_dataset = BinTokenDataset(train_path, context_length, dtype=dtype)
-    val_dataset   = BinTokenDataset(val_path,   context_length, dtype=dtype)
+    train_dataset = TokenDataset(train_path, context_length)
+    val_dataset   = TokenDataset(val_path,   context_length)
 
     if ddp:
         train_sampler = DistributedSampler(
@@ -240,7 +215,6 @@ def main():
         val_sampler   = None
 
     # 2 workers per GPU is enough for memory-mapped files
-    # persistent_workers=False so workers die between epochs freeing RAM
     num_workers = 2
 
     train_loader = DataLoader(
