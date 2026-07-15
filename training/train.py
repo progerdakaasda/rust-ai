@@ -104,17 +104,16 @@ def main():
     # ==========================
     # Distributed setup
     # ==========================
-    # Detect if we were launched with torchrun / torch.distributed.launch
     ddp = "LOCAL_RANK" in os.environ
 
     if ddp:
-        local_rank  = int(os.environ["LOCAL_RANK"])
-        world_size  = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
     else:
-        local_rank  = 0
-        world_size  = 1
+        local_rank = 0
+        world_size = 1
 
-    # Every process must have a GPU when doing DDP
+    # Every process must have a GPU
     if not torch.cuda.is_available():
         raise RuntimeError(
             "No CUDA devices found. This script requires at least one GPU."
@@ -152,18 +151,18 @@ def main():
     # ==========================
     # Settings
     # ==========================
-    batch_size                 = 8
+    batch_size                  = 8
     gradient_accumulation_steps = 2
-    context_length             = 1024
-    max_steps                  = 200_000
+    context_length              = 1024
+    max_steps                   = 200_000
 
-    learning_rate              = 3e-4
-    min_learning_rate          = 3e-5
-    warmup_steps               = 2000
-    weight_decay               = 0.1
+    learning_rate               = 3e-4
+    min_learning_rate           = 3e-5
+    warmup_steps                = 2000
+    weight_decay                = 0.1
 
-    validation_interval        = 500
-    checkpoint_interval        = 500
+    validation_interval         = 500
+    checkpoint_interval         = 500
 
     # ==========================
     # Timer
@@ -184,7 +183,7 @@ def main():
         os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     if ddp:
-        dist.barrier()  # All ranks wait until the directory exists
+        dist.barrier()  # All ranks wait until directory exists
 
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest.pt")
     best_checkpoint   = os.path.join(args.checkpoint_dir, "best.pt")
@@ -240,39 +239,50 @@ def main():
         train_sampler = None
         val_sampler   = None
 
-    loader_kwargs = dict(
-        batch_size=batch_size,
-        num_workers=args.workers,
-        pin_memory=True,
-        persistent_workers=(args.workers > 0),
-        drop_last=True,
-        prefetch_factor=(2 if args.workers > 0 else None),
-    )
+    # 2 workers per GPU is enough for memory-mapped files
+    # persistent_workers=False so workers die between epochs freeing RAM
+    num_workers = 2
 
     train_loader = DataLoader(
         train_dataset,
+        batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        **loader_kwargs,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        drop_last=True,
+        prefetch_factor=2,
     )
 
     val_loader = DataLoader(
         val_dataset,
+        batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        **{**loader_kwargs, "drop_last": False},
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        drop_last=False,
+        prefetch_factor=2,
     )
 
     train_iter = iter(train_loader)
 
     # ==========================
-    # Model  –– built directly on the target GPU
+    # Model -- built directly on the target GPU
     # ==========================
     if is_main_process:
         print("Creating model...", flush=True)
 
-    # Build on the correct device immediately so weights never touch CPU RAM
+    # Build directly on GPU - never touches CPU RAM
     base_model = GPT(GPTConfig()).to(device)
+
+    # Verify model is on GPU
+    if is_main_process:
+        for i in range(torch.cuda.device_count()):
+            mem = torch.cuda.memory_allocated(i) / 1024**2
+            print(f"GPU {i} VRAM after model load: {mem:.1f} MB", flush=True)
 
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -295,7 +305,7 @@ def main():
         base_model.parameters(),
         lr=learning_rate,
         weight_decay=weight_decay,
-        fused=True,   # Faster fused CUDA kernel for AdamW
+        fused=True,  # Faster fused CUDA kernel for AdamW
     )
 
     scheduler = cosine_scheduler(
@@ -334,7 +344,7 @@ def main():
         if is_main_process:
             print(f"Resumed from step {step}", flush=True)
 
-        # Make sure all ranks start with the same weights
+        # Make sure all ranks start with identical weights
         if ddp:
             for param in base_model.parameters():
                 dist.broadcast(param.data, src=0)
@@ -475,7 +485,7 @@ def main():
             if ddp:
                 dist.barrier()
 
-            val_loss = validate()   # All ranks participate now
+            val_loss = validate()  # All ranks participate now
 
             if is_main_process:
                 print(f"Validation loss: {val_loss:.4f}", flush=True)
