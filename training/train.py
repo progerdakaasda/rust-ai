@@ -1,5 +1,4 @@
 import os
-import დრო
 import time
 import signal
 import argparse
