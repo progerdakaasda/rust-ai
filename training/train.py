@@ -2,7 +2,6 @@ import os
 import time
 import signal
 import argparse
-import shutil
 from contextlib import nullcontext
 
 import numpy as np
@@ -21,8 +20,13 @@ from training.scheduler import cosine_scheduler
 
 class BinTokenDataset(Dataset):
     """
-    Memory-mapped token dataset.
-    Expects a flat binary file of token IDs saved as uint16 or uint32.
+    Memory-mapped token dataset for flat binary token files.
+
+    Expects:
+      - train.bin
+      - validation.bin
+
+    where each file is a flat array of token IDs stored as uint16 or uint32.
     """
     def __init__(self, path: str, context_length: int, dtype: np.dtype):
         self.path = path
@@ -30,6 +34,11 @@ class BinTokenDataset(Dataset):
         self.dtype = np.dtype(dtype)
         self._data = None
         self._n_tokens = os.path.getsize(path) // self.dtype.itemsize
+
+        if self._n_tokens <= context_length + 1:
+            raise ValueError(
+                f"File {path} is too small for context_length={context_length}"
+            )
 
     def _open(self):
         if self._data is None:
@@ -167,7 +176,7 @@ def main():
     input_latest = os.path.join(args.dataset_dir, "checkpoints", "latest.pt")
     input_best = os.path.join(args.dataset_dir, "checkpoints", "best.pt")
 
-    # If the Kaggle dataset contains checkpoints, bootstrap them into working dir.
+    # Bootstrap checkpoint from Kaggle input if needed
     if args.resume:
         if (not os.path.exists(latest_checkpoint)) and os.path.exists(input_latest):
             shutil.copy2(input_latest, latest_checkpoint)
@@ -185,6 +194,10 @@ def main():
 
     train_path = os.path.join(args.dataset_dir, "train.bin")
     val_path = os.path.join(args.dataset_dir, "validation.bin")
+
+    if is_main_process:
+        print(f"Train file: {train_path}", flush=True)
+        print(f"Validation file: {val_path}", flush=True)
 
     train_dataset = BinTokenDataset(
         train_path,
@@ -207,27 +220,28 @@ def main():
     else:
         train_sampler = None
 
-    train_loader = DataLoader(
-        train_dataset,
+    loader_kwargs = dict(
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=True,
         persistent_workers=(args.workers > 0),
-        prefetch_factor=2 if args.workers > 0 else None,
         drop_last=True
+    )
+
+    if args.workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        **loader_kwargs
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-        persistent_workers=(args.workers > 0),
-        prefetch_factor=2 if args.workers > 0 else None,
-        drop_last=False
+        **{**loader_kwargs, "drop_last": False}
     )
 
     train_iter = iter(train_loader)
@@ -239,6 +253,16 @@ def main():
         print("Creating model...", flush=True)
 
     base_model = GPT(GPTConfig()).to(device)
+
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            base_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False
+        )
+    else:
+        model = base_model
 
     if is_main_process:
         parameters = sum(p.numel() for p in base_model.parameters())
@@ -288,17 +312,6 @@ def main():
                 print(f"Resumed from step {step}", flush=True)
         elif is_main_process:
             print("No latest.pt found, starting from scratch.", flush=True)
-
-    # Wrap in DDP after loading checkpoint
-    if ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            base_model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False
-        )
-    else:
-        model = base_model
 
     # ==========================
     # Shutdown
